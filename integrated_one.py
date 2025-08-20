@@ -27,22 +27,16 @@ def get_db_connection():
 
 # -------------------- Geocoding & Distance --------------------
 def geocode_address(address):
-    """Sanitize and geocode address string using Google Maps."""
     if not address or not isinstance(address, str):
-        print(f"Geocode skipped: Invalid address input → {address}")
         return None, None
-
     clean_address = address.strip().replace('\n', ' ').replace('\r', ' ')
     try:
         result = gmaps.geocode(clean_address)
         if result and 'geometry' in result[0]:
             loc = result[0]['geometry']['location']
-            lat, lng = loc.get('lat'), loc.get('lng')
-            if lat is not None and lng is not None:
-                return lat, lng
-        print(f"Geocode failed: No location found for → {clean_address}")
-    except Exception as e:
-        print(f"Geocode error for '{clean_address}': {e}")
+            return loc.get('lat'), loc.get('lng')
+    except:
+        pass
     return None, None
 
 def get_distance_and_time(origin, destination):
@@ -58,7 +52,7 @@ def get_distance_and_time(origin, destination):
 def get_direction_link(origin_lat, origin_lng, dest_lat, dest_lng):
     return f"https://www.google.com/maps/dir/?api=1&origin={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&travelmode=driving"
 
-# -------------------- Zone & Rider Logic --------------------
+# -------------------- Zone Logic --------------------
 def load_zones():
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
@@ -84,23 +78,80 @@ def find_zone(lat, lng, zones):
             return z['id'], z['title']
     return None, None
 
-def get_available_riders():
+def get_active_delivery_zone(zone_id):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT r.id, r.title, ra.current_lat, ra.current_lng, ra.is_available, ra.active_order_count, ra.max_capacity
+        SELECT id, zone_name, zone_data, radius_km, delivery_time_min, delivery_time_max
+        FROM tbl_delivery_zones
+        WHERE id = %s AND is_active = 1
+    """, (zone_id,))
+    zone = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return zone
+
+def is_within_zone(lat, lng, zone_data, radius_km):
+    center_lat = zone_data['center_lat']
+    center_lng = zone_data['center_lng']
+    distance = ((lat - center_lat)**2 + (lng - center_lng)**2)**0.5 * 111
+    return distance <= radius_km
+
+def validate_eta(eta_str, zone_meta):
+    try:
+        eta_min = int(eta_str.replace(' mins', '').replace(' min', '').strip())
+        return zone_meta['delivery_time_min'] <= eta_min <= zone_meta['delivery_time_max']
+    except:
+        return False
+
+# -------------------- Rider Logic --------------------
+def get_available_riders(zone_id=None):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    query = """
+        SELECT r.id, r.title, ra.current_lat, ra.current_lng, ra.is_available,
+               ra.active_order_count, ra.max_capacity,
+               rp.acceptance_rate, rp.avg_delivery_time, rp.rejection_count
         FROM tbl_rider r
         JOIN tbl_rider_availability ra ON r.id = ra.rider_id
+        LEFT JOIN tbl_rider_performance rp ON r.id = rp.rider_id
         WHERE r.status = 1 AND ra.is_available = 1 AND ra.active_order_count < ra.max_capacity
-    """)
+    """
+    cursor.execute(query)
     riders = cursor.fetchall()
     cursor.close()
     conn.close()
+
+    if zone_id:
+        route_riders = get_riders_by_route(zone_id)
+        riders = [r for r in riders if r['id'] in route_riders]
+
     return riders
+
+def get_riders_by_route(zone_id):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT DISTINCT rider_id FROM tbl_rider_routes WHERE zone_id = %s", (zone_id,))
+    rider_ids = [r['rider_id'] for r in cursor.fetchall()]
+    cursor.close()
+    conn.close()
+    return rider_ids
+
+def calculate_rider_score(rider, dist_km):
+    acceptance_rate = rider.get('acceptance_rate') or 0
+    avg_delivery_time = rider.get('avg_delivery_time') or 30
+    score = (
+        0.5 * acceptance_rate +
+        0.3 * (1 / (dist_km + 1)) +
+        0.2 * (1 / (avg_delivery_time + 1))
+    )
+    return score
 
 # -------------------- Order Preparation --------------------
 def get_preparation_time_summary(item_string):
-    items = [i.strip().lower() for i in item_string.split(',') if i.strip()]
+    if not item_string or not isinstance(item_string, str):
+        return 0, []
+    items = [i.strip().lower() for i in item_string.split(',')]
     total_time = 0
     details = []
     for item in items:
@@ -109,13 +160,21 @@ def get_preparation_time_summary(item_string):
         details.append(f"{item.title()} ({default_time} min)")
     return total_time, details
 
-# -------------------- Assignment & Notification --------------------
-def assign_order(order_id, rider_id, table_name):
+# -------------------- Assignment & Notifications --------------------
+def assign_order(order_id, rider_id, table_name, score, zone_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(f"UPDATE {table_name} SET rid = %s, order_status = 1 WHERE id = %s", (rider_id, order_id))
     cursor.execute("UPDATE tbl_rider SET rstatus = 1 WHERE id = %s", (rider_id,))
     cursor.execute("UPDATE tbl_rider_availability SET active_order_count = active_order_count + 1 WHERE rider_id = %s", (rider_id,))
+    cursor.execute("""
+        INSERT INTO tbl_rider_assignment (order_id, rider_id, assigned_at, score)
+        VALUES (%s, %s, NOW(), %s)
+    """, (order_id, rider_id, score))
+    cursor.execute("""
+        INSERT INTO tbl_delivery (order_id, rider_id, rider_response, status, assigned_at, zone_id)
+        VALUES (%s, %s, %s, %s, NOW(), %s)
+    """, (order_id, rider_id, 'pending', 'assigned', zone_id))
     conn.commit()
     cursor.close()
     conn.close()
@@ -147,10 +206,20 @@ def notify_user(uid, order_id, name):
     cursor.close()
     conn.close()
 
+def log_rider_rejection(order_id, rider_id, reason):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO tbl_rider_rejections (order_id, rider_id, rejection_time, reason, created_at)
+        VALUES (%s, %s, NOW(), %s, NOW())
+    """, (order_id, rider_id, reason))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
 # -------------------- Core Assignment Logic --------------------
 def process_order_table(table_name):
     zones = load_zones()
-    riders = get_available_riders()
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute(f"SELECT * FROM {table_name} WHERE order_status = 0")
@@ -165,18 +234,25 @@ def process_order_table(table_name):
     for order in orders:
         full_address = f"{order['address']}, {order['landmark']}"
         lat, lng = geocode_address(full_address)
-        print(f"Order #{order['id']} → Geocoded: ({lat}, {lng}) from '{full_address}'")
-
         if not lat or not lng:
             print(f"Skipping Order #{order['id']} (Invalid address)")
             continue
 
         zone_id, zone_title = find_zone(lat, lng, zones)
+        zone_meta = get_active_delivery_zone(zone_id)
+        if not zone_meta:
+            print(f"Zone #{zone_id} inactive or undefined. Skipping Order #{order['id']}")
+            continue
 
-        total_time, prep_details = 0, []
-        if table_name == "tbl_normal_order" and 'items' in order:
-            total_time, prep_details = get_preparation_time_summary(order['items'])
-        elif table_name == "tbl_subscribe_order":
+        if not is_within_zone(lat, lng, zone_meta['zone_data'], zone_meta['radius_km']):
+            print(f"Order #{order['id']} outside zone radius. Skipping.")
+            continue
+
+        riders = get_available_riders(zone_id)
+
+        if table_name == "tbl_normal_order":
+            total_time, prep_details = get_preparation_time_summary(order.get('items'))
+        else:
             conn = get_db_connection()
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT ptitle FROM tbl_subscribe_order_product WHERE oid = %s", (order['id'],))
@@ -186,17 +262,33 @@ def process_order_table(table_name):
             item_names = [p['ptitle'] for p in products]
             total_time, prep_details = get_preparation_time_summary(','.join(item_names))
 
-        nearest_rider, best_dist, best_eta, best_link = None, None, None, None
+        best_score, nearest_rider = -1, None
+        best_dist, best_eta, best_link = None, None, None
+        rejected_riders = []
+
         for r in riders:
             r_lat, r_lng = float(r['current_lat']), float(r['current_lng'])
             dist, eta = get_distance_and_time((r_lat, r_lng), (lat, lng))
-            if dist and (best_dist is None or float(dist.replace(' km', '').replace(',', '')) < float(best_dist.replace(' km', '').replace(',', ''))):
-                nearest_rider = r
-                best_dist, best_eta = dist, eta
-                best_link = get_direction_link(r_lat, r_lng, lat, lng)
+
+            if dist and eta:
+                dist_km = float(dist.replace(' km', '').replace(',', ''))
+                if not validate_eta(eta, zone_meta):
+                    rejected_riders.append((r['id'], "eta_invalid"))
+                    continue
+                score = calculate_rider_score(r, dist_km)
+                if score > best_score:
+                    nearest_rider = r
+                    best_score = score
+                    best_dist = dist
+                    best_eta = eta
+                    best_link = get_direction_link(r_lat, r_lng, lat, lng)
+                else:
+                    rejected_riders.append((r['id'], "low_score"))
+            else:
+                rejected_riders.append((r['id'], "distance_eta_unavailable"))
 
         if nearest_rider:
-            assign_order(order['id'], nearest_rider['id'], table_name)
+            assign_order(order['id'], nearest_rider['id'], table_name, best_score, zone_id)
             insert_rider_notifications(order['id'], [nearest_rider['id']], table_name)
             notify_user(order.get('uid', 0), order['id'], order.get('name', 'User'))
 
@@ -211,16 +303,22 @@ def process_order_table(table_name):
             order['distance'] = best_dist
             order['eta'] = best_eta
             order['route_link'] = best_link
-
             assigned_orders.append(order)
+            assigned += 1
+
+            for rider_id, reason in rejected_riders:
+                if rider_id != nearest_rider['id']:
+                    log_rider_rejection(order['id'], rider_id, reason)
         else:
             not_assigned += 1
             print(f"No available rider for Order #{order['id']}")
+            for rider_id, reason in rejected_riders:
+                log_rider_rejection(order['id'], rider_id, reason)
 
     order_map.save("order_assignment_map.html")
     return assigned, not_assigned, assigned_orders
 
-# -------------------- Flask Endpoints --------------------
+# -------------------- Flask Routes --------------------
 @app.route('/')
 def home():
     return jsonify({"message": "API is working!"})
@@ -253,11 +351,9 @@ def assign_orders():
         print("Error in /assign_orders:", e)
         return jsonify({"error": str(e)})
 
-# -------------------- Run Locally or on Render --------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, debug=True)
-
 
 
 
