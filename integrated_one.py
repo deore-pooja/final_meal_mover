@@ -1,4 +1,5 @@
 import os
+import math
 import mysql.connector
 import googlemaps
 import folium
@@ -24,11 +25,21 @@ def get_db_connection():
     conn.ping(reconnect=True, attempts=3, delay=5)
     return conn
 
+# -------------------- Helpers --------------------
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance in km."""
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb/2)**2
+    return 2 * r * math.asin(math.sqrt(a))
+
 # -------------------- Geocoding & Distance --------------------
 def geocode_address(address, order_id=None):
-    """Geocode an address, fallback to Pune if failed."""
+    """Geocode an address, fallback to Pune if failed (keeps order inside service area checks)."""
     if not address or not isinstance(address, str) or address.strip() == "":
-        print(f"❌ Order #{order_id}: Empty/invalid address")
+        print(f" Order #{order_id}: Empty/invalid address")
         return None, None
 
     clean_address = " ".join(address.strip().split())
@@ -38,32 +49,39 @@ def geocode_address(address, order_id=None):
             loc = result[0]["geometry"]["location"]
             return float(loc.get("lat")), float(loc.get("lng"))
         else:
-            print(f"❌ Order #{order_id}: Geocode failed → '{clean_address}'")
+            print(f" Order #{order_id}: Geocode failed → '{clean_address}'")
     except Exception as e:
-        print(f"⚠️ Geocode API error for Order #{order_id}: {e}")
+        print(f" Geocode API error for Order #{order_id}: {e}")
 
     # Fallback: Pune city center
     fallback_lat, fallback_lng = 18.5204, 73.8567
-    print(f"⚠️ Order #{order_id}: Using fallback {fallback_lat},{fallback_lng}")
+    print(f" Order #{order_id}: Using fallback {fallback_lat},{fallback_lng}")
     return fallback_lat, fallback_lng
 
-def get_distance_and_time(origin, destination):
-    """Return driving distance & duration between 2 coordinates."""
+def driving_distance(origin, destination):
+    """
+    Returns (km_float, distance_text, duration_text).
+    If Google API fails, returns (None, None, None).
+    """
     try:
         res = gmaps.distance_matrix([origin], [destination], mode="driving")
-        element = res['rows'][0]['elements'][0]
-        if element['status'] == 'OK':
-            return element['distance']['text'], element['duration']['text']
+        el = res['rows'][0]['elements'][0]
+        if el['status'] != 'OK':
+            return None, None, None
+        dist_text = el['distance']['text']            # e.g., "5.4 km"
+        dur_text  = el['duration']['text']            # e.g., "14 mins"
+        km = float(dist_text.replace("km", "").replace(",", "").strip())
+        return km, dist_text, dur_text
     except Exception as e:
-        print("Distance error:", e)
-    return None, None
+        print(" distance_matrix error:", e)
+        return None, None, None
 
 def get_direction_link(origin_lat, origin_lng, dest_lat, dest_lng):
     return f"https://www.google.com/maps/dir/?api=1&origin={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&travelmode=driving"
 
 # -------------------- Zone Logic --------------------
 def load_zones():
-    """Load all active zones and convert into shapely polygons."""
+    """Load all active zones and convert into shapely polygons (lng, lat for shapely)."""
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT id, title, coordinates FROM zones WHERE status = 1")
@@ -71,33 +89,34 @@ def load_zones():
     for row in cursor.fetchall():
         try:
             coords = []
-            for pt in row['coordinates'].split(";"):  # safer split
+            # Expecting coordinates like "(lat,lng);(lat,lng);..."
+            for pt in row['coordinates'].split(";"):
                 latlng = pt.strip().replace("(", "").replace(")", "").split(",")
                 if len(latlng) == 2:
                     lat, lng = map(float, latlng)
-                    coords.append((lng, lat))  # shapely uses (x=lng, y=lat)
+                    coords.append((lng, lat))  # shapely: (x=lng, y=lat)
             if coords:
                 zones.append({
-                    'id': row['id'],
-                    'title': row['title'],
-                    'polygon': Polygon(coords)
+                    "id": row["id"],
+                    "title": row["title"],
+                    "polygon": Polygon(coords)
                 })
         except Exception as e:
-            print(f"⚠️ Error parsing zone {row['id']}: {e}")
+            print(f" Error parsing zone {row['id']}: {e}")
     cursor.close()
     conn.close()
     return zones
 
 def find_zone(lat, lng, zones):
-    """Check which zone contains the given point."""
-    point = Point(lng, lat)  # shapely: (x=lng, y=lat)
+    """Return (zone_id, zone_title) that contains the point, else (None, None)."""
+    pt = Point(lng, lat)
     for z in zones:
-        if z['polygon'].contains(point):
-            return z['id'], z['title']
+        if z["polygon"].contains(pt):
+            return z["id"], z["title"]
     return None, None
 
 def get_active_delivery_zone(zone_id):
-    """Get delivery zone meta from DB."""
+    """Delivery zone meta (center+radius+time window)."""
     if not zone_id:
         return None
     conn = get_db_connection()
@@ -116,17 +135,8 @@ def is_within_zone(lat, lng, zone_meta):
     """Check if (lat,lng) is inside delivery zone radius."""
     if not zone_meta:
         return False
-    center_lat, center_lng = zone_meta['center_lat'], zone_meta['center_lng']
-    distance = ((lat - center_lat)**2 + (lng - center_lng)**2) ** 0.5 * 111
-    return distance <= zone_meta['radius_km']
-
-def validate_eta(eta_str, zone_meta):
-    """Validate ETA against zone delivery window."""
-    try:
-        eta_min = int(eta_str.replace("mins", "").replace("min", "").strip())
-        return zone_meta['delivery_time_min'] <= eta_min <= zone_meta['delivery_time_max']
-    except:
-        return False
+    d_km = haversine_km(lat, lng, zone_meta["center_lat"], zone_meta["center_lng"])
+    return d_km <= float(zone_meta["radius_km"] or 0)
 
 # -------------------- Rider Logic --------------------
 def get_available_riders(zone_id=None):
@@ -135,11 +145,13 @@ def get_available_riders(zone_id=None):
     cursor.execute("""
         SELECT r.id, r.title, ra.current_lat, ra.current_lng, ra.is_available,
                ra.active_order_count, ra.max_capacity,
-               rp.acceptance_rate, rp.avg_delivery_time
+               COALESCE(rp.acceptance_rate, 0) AS acceptance_rate,
+               COALESCE(rp.avg_delivery_time, 30) AS avg_delivery_time
         FROM tbl_rider r
         JOIN tbl_rider_availability ra ON r.id = ra.rider_id
         LEFT JOIN tbl_rider_performance rp ON r.id = rp.rider_id
-        WHERE r.status = 1 AND ra.is_available = 1 
+        WHERE r.status = 1
+          AND ra.is_available = 1
           AND ra.active_order_count < ra.max_capacity
     """)
     riders = cursor.fetchall()
@@ -148,7 +160,7 @@ def get_available_riders(zone_id=None):
 
     if zone_id:
         allowed = get_riders_by_route(zone_id)
-        riders = [r for r in riders if r['id'] in allowed]
+        riders = [r for r in riders if r["id"] in allowed]
 
     return riders
 
@@ -156,26 +168,16 @@ def get_riders_by_route(zone_id):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT DISTINCT rider_id FROM tbl_rider_routes WHERE zone_id = %s", (zone_id,))
-    ids = [r['rider_id'] for r in cursor.fetchall()]
+    ids = [r["rider_id"] for r in cursor.fetchall()]
     cursor.close()
     conn.close()
     return ids
-
-def calculate_rider_score(rider, dist_km):
-    """Compute rider score from acceptance_rate, distance, avg_delivery_time."""
-    acceptance_rate = rider.get('acceptance_rate') or 0
-    avg_delivery_time = rider.get('avg_delivery_time') or 30
-    return (
-        0.5 * acceptance_rate +
-        0.3 * (1 / (dist_km + 1)) +
-        0.2 * (1 / (avg_delivery_time + 1))
-    )
 
 # -------------------- Order Preparation --------------------
 def get_preparation_time_summary(item_string):
     if not item_string:
         return 0, []
-    items = [i.strip().lower() for i in item_string.split(',') if i.strip()]
+    items = [i.strip().lower() for i in item_string.split(",") if i.strip()]
     total, details = 0, []
     for item in items:
         prep_time = 10
@@ -240,12 +242,13 @@ def log_rider_rejection(order_id, rider_id, reason):
     cursor.close()
     conn.close()
 
-# -------------------- Core Assignment Logic --------------------
+# -------------------- Core Assignment Logic (nearest rider only) --------------------
 def process_order_table(table_name):
     zones = load_zones()
+
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute(f"SELECT * FROM {table_name} WHERE order_status=0")
+    cursor.execute(f"SELECT * FROM {table_name} WHERE order_status = 0")
     orders = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -258,82 +261,91 @@ def process_order_table(table_name):
         full_address = f"{order.get('address','')} {order.get('landmark','')} India"
         lat, lng = geocode_address(full_address, order_id=order['id'])
         if not lat or not lng:
-            print(f"❌ Skipping Order #{order['id']} (no valid coordinates)")
+            print(f" Skipping Order #{order['id']} (no valid coordinates)")
             not_assigned += 1
             continue
 
         zone_id, zone_title = find_zone(lat, lng, zones)
         zone_meta = get_active_delivery_zone(zone_id)
         if not zone_meta or not is_within_zone(lat, lng, zone_meta):
-            print(f"⚠️ Order #{order['id']} outside zone. Skipping.")
+            print(f" Order #{order['id']} outside service zone. Skipping.")
             not_assigned += 1
             continue
 
         riders = get_available_riders(zone_id)
         if not riders:
-            print(f"❌ No riders available for Order #{order['id']}")
+            # Fallback: search all available riders city-wide
+            riders = get_available_riders(None)
+
+        if not riders:
+            print(f" No available riders in system for Order #{order['id']}")
             not_assigned += 1
             continue
 
-        # prep time calc
+        # (Optional) prep time calc — kept for completeness
         if table_name == "tbl_normal_order":
-            total_time, prep_details = get_preparation_time_summary(order.get('items'))
+            total_time, _ = get_preparation_time_summary(order.get('items'))
         else:
-            c2 = get_db_connection().cursor(dictionary=True)
+            c2_conn = get_db_connection()
+            c2 = c2_conn.cursor(dictionary=True)
             c2.execute("SELECT ptitle FROM tbl_subscribe_order_product WHERE oid=%s", (order['id'],))
             products = c2.fetchall()
             c2.close()
+            c2_conn.close()
             names = [p['ptitle'] for p in products]
-            total_time, prep_details = get_preparation_time_summary(",".join(names))
+            total_time, _ = get_preparation_time_summary(",".join(names))
 
-        best_rider, best_score, best_dist, best_eta, best_link = None, -1, None, None, None
-        rejected_riders = []
+        # ---------- NEAREST RIDER SELECTION (no ETA constraint) ----------
+        best = {
+            "rider": None,
+            "km": float("inf"),
+            "dist_text": None,
+            "eta_text": None,
+            "link": None
+        }
 
         for r in riders:
             r_lat, r_lng = float(r['current_lat']), float(r['current_lng'])
-            dist, eta = get_distance_and_time((r_lat, r_lng), (lat, lng))
-            if not dist or not eta:
-                rejected_riders.append((r['id'], "distance_eta_unavailable"))
-                continue
 
-            dist_km = float(dist.replace(" km", "").replace(",", ""))
-            if not validate_eta(eta, zone_meta):
-                rejected_riders.append((r['id'], "eta_invalid"))
-                continue
+            km, dist_text, eta_text = driving_distance((r_lat, r_lng), (lat, lng))
+            if km is None:
+                # fall back to straight-line
+                km = haversine_km(r_lat, r_lng, lat, lng)
+                dist_text = f"{km:.2f} km"
+                eta_text = "n/a"
 
-            score = calculate_rider_score(r, dist_km)
-            if score > best_score:
-                best_rider, best_score = r, score
-                best_dist, best_eta = dist, eta
-                best_link = get_direction_link(r_lat, r_lng, lat, lng)
+            if km < best["km"]:
+                best.update({
+                    "rider": r,
+                    "km": km,
+                    "dist_text": dist_text,
+                    "eta_text": eta_text,
+                    "link": get_direction_link(r_lat, r_lng, lat, lng)
+                })
 
-        if best_rider:
-            assign_order(order['id'], best_rider['id'], table_name, best_score, zone_id)
-            insert_rider_notifications(order['id'], [best_rider['id']], table_name)
+        if best["rider"]:
+            assign_order(order['id'], best["rider"]['id'], table_name, score=1.0/(best["km"]+1e-6), zone_id=zone_id)
+            insert_rider_notifications(order['id'], [best["rider"]['id']], table_name)
             notify_user(order.get('uid', 0), order['id'], order.get('name', 'User'))
 
             folium.Marker(
                 location=[lat, lng],
-                popup=f"Order #{order['id']} → {best_rider['title']} ({best_dist}, {best_eta})",
+                popup=f"Order #{order['id']} → {best['rider']['title']} ({best['dist_text']}, {best['eta_text']})",
                 icon=folium.Icon(color="green")
             ).add_to(order_map)
 
             order.update({
-                "assigned_rider_name": best_rider['title'],
+                "assigned_rider_name": best["rider"]['title'],
                 "zone": zone_title,
-                "distance": best_dist,
-                "eta": best_eta,
-                "route_link": best_link
+                "distance": best["dist_text"],
+                "eta": best["eta_text"],
+                "route_link": best["link"]
             })
             assigned_orders.append(order)
             assigned += 1
         else:
-            print(f"❌ No suitable rider for Order #{order['id']}")
+            print(f" No suitable rider for Order #{order['id']}")
             not_assigned += 1
-
-        for rid, reason in rejected_riders:
-            if not best_rider or rid != best_rider['id']:
-                log_rider_rejection(order['id'], rid, reason)
 
     order_map.save("order_assignment_map.html")
     return assigned, not_assigned, assigned_orders
