@@ -26,18 +26,29 @@ def get_db_connection():
     return conn
 
 # -------------------- Geocoding & Distance --------------------
-def geocode_address(address):
+def geocode_address(address, order_id=None):
+    """Geocode address and return lat/lng. Falls back if geocoding fails."""
     if not address or not isinstance(address, str):
+        print(f"❌ Order #{order_id}: Empty or invalid address field")
         return None, None
-    clean_address = address.strip().replace('\n', ' ').replace('\r', ' ')
+
+    # Clean address string
+    clean_address = " ".join(address.strip().split())
+
     try:
         result = gmaps.geocode(clean_address)
-        if result and 'geometry' in result[0]:
-            loc = result[0]['geometry']['location']
-            return loc.get('lat'), loc.get('lng')
-    except:
-        pass
-    return None, None
+        if result and "geometry" in result[0]:
+            loc = result[0]["geometry"]["location"]
+            return loc.get("lat"), loc.get("lng")
+        else:
+            print(f"❌ Order #{order_id}: Geocode failed → '{clean_address}'")
+    except Exception as e:
+        print(f"⚠️ Geocode API error for Order #{order_id}: {e}")
+
+    # ---- Fallback: default city center (Pune as example) ----
+    fallback_lat, fallback_lng = 18.5204, 73.8567
+    print(f"⚠️ Order #{order_id}: Using fallback location {fallback_lat},{fallback_lng}")
+    return fallback_lat, fallback_lng
 
 def get_distance_and_time(origin, destination):
     try:
@@ -232,20 +243,17 @@ def process_order_table(table_name):
     assigned, not_assigned = 0, 0
 
     for order in orders:
-        full_address = f"{order['address']}, {order['landmark']}"
-        lat, lng = geocode_address(full_address)
-        if not lat or not lng:
-            print(f"Skipping Order #{order['id']} (Invalid address)")
-            continue
+        full_address = f"{order['address']}, {order['landmark']}, India"
+        lat, lng = geocode_address(full_address, order_id=order['id'])
 
         zone_id, zone_title = find_zone(lat, lng, zones)
         zone_meta = get_active_delivery_zone(zone_id)
         if not zone_meta:
-            print(f"Zone #{zone_id} inactive or undefined. Skipping Order #{order['id']}")
+            print(f"⚠️ Zone #{zone_id} inactive or undefined. Skipping Order #{order['id']}")
             continue
 
         if not is_within_zone(lat, lng, zone_meta['zone_data'], zone_meta['radius_km']):
-            print(f"Order #{order['id']} outside zone radius. Skipping.")
+            print(f"⚠️ Order #{order['id']} outside zone radius. Skipping.")
             continue
 
         riders = get_available_riders(zone_id)
@@ -311,7 +319,7 @@ def process_order_table(table_name):
                     log_rider_rejection(order['id'], rider_id, reason)
         else:
             not_assigned += 1
-            print(f"No available rider for Order #{order['id']}")
+            print(f"❌ No available rider for Order #{order['id']}")
             for rider_id, reason in rejected_riders:
                 log_rider_rejection(order['id'], rider_id, reason)
 
@@ -354,6 +362,7 @@ def assign_orders():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, debug=True)
+
 
 
 
