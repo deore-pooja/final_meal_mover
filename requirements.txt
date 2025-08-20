@@ -1,0 +1,12 @@
+Flask==2.3.2
+mysql-connector-python
+python-dotenv
+googlemaps
+pandas
+openpyxl
+folium
+Shapely
+
+
+
+
