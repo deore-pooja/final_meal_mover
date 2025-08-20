@@ -61,8 +61,8 @@ def get_preparation_time_summary(item_string):
         details.append(f"{item.title()} ({default_time} min)")
     return total_time, details
 
-def find_zone(lat, lng, zones):
-    point = Point(lat, lng)
+def find_zone(lng, lat, zones):
+    point = Point(lng, lat)
     for z in zones:
         if z['polygon'].contains(point):
             return z['id'], z['title']
@@ -90,9 +90,9 @@ def get_active_delivery_zone(zone_id):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT zone_id, zone_data, radius_km, delivery_time_min, delivery_time_max
+        SELECT id, zone_name, zone_data, radius_km, delivery_time_min, delivery_time_max
         FROM tbl_delivery_zones
-        WHERE zone_id = %s AND is_active = 1
+        WHERE id = %s AND is_active = 1
     """, (zone_id,))
     zone = cursor.fetchone()
     cursor.close()
