@@ -6,14 +6,14 @@ import googlemaps
 import folium
 from flask import Flask, jsonify
 from dotenv import load_dotenv
-from shapely.geometry import Point, Polygon, shape
+from shapely.geometry import Point
+from shapely.wkt import loads as wkt_loads
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
 gmaps = googlemaps.Client(key=os.getenv("GOOGLE_MAPS_API_KEY"))
 app = Flask(__name__)
-
-# -------------------- Utility Functions --------------------
 
 # -------------------- Utility Functions --------------------
 
@@ -55,7 +55,7 @@ def get_distance_and_time(origin, destination):
     return None, None
 
 def get_direction_link(origin_lat, origin_lng, dest_lat, dest_lng):
-    return f"http://maps.google.com/maps?q={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&travelmode=driving"
+    return f"https://www.google.com/maps/dir/?api=1&origin={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&travelmode=driving"
 
 def get_preparation_time_summary(item_string):
     if not item_string or not isinstance(item_string, str):
@@ -81,20 +81,20 @@ def load_zones():
     if not conn:
         return []
     cursor = conn.cursor(dictionary=True)
-    # Use ST_AsText to convert the GEOMETRY object to a readable string (WKT)
-    cursor.execute("SELECT id, title, ST_AsText(coordinates) AS coordinates FROM zones WHERE status = 1")
+    # Correctly fetch GEOMETRY data as WKT string
+    cursor.execute("SELECT id, title, ST_AsText(coordinates) as coordinates FROM zones WHERE status = 1")
     zones = []
     for row in cursor.fetchall():
         try:
-            # The coordinates are now a WKT string, which shapely can parse directly
-            polygon_shape = shape(row['coordinates'])
+            # Use shapely.wkt.loads to create a Polygon from the WKT string
+            polygon_shape = wkt_loads(row['coordinates'])
             zones.append({'id': row['id'], 'title': row['title'], 'polygon': polygon_shape})
         except Exception as e:
             print(f"[ERROR] Zone parsing failed for zone {row['id']}: {e}")
             continue
     cursor.close()
     conn.close()
-    print(f"[INFO] Loaded {len(zones)} active zones")
+    print(f"[INFO] Loaded {len(zones)} active zones.")
     return zones
 
 def get_active_delivery_zone(zone_id):
@@ -118,22 +118,6 @@ def get_active_delivery_zone(zone_id):
         except Exception:
             zone["zone_data"] = {}
     return zone
-
-def is_within_zone(lat, lng, zone_data, radius_km=None):
-    try:
-        point = Point(lng, lat)
-        if zone_data and "type" in zone_data:
-            polygon = shape(zone_data)
-            return polygon.contains(point)
-        if radius_km and "center_lat" in zone_data and "center_lng" in zone_data:
-            center_lat = float(zone_data['center_lat'])
-            center_lng = float(zone_data['center_lng'])
-            # Simplified distance calculation
-            distance = ((lat - center_lat)**2 + (lng - center_lng)**2)**0.5 * 111.32
-            return distance <= radius_km
-    except Exception as e:
-        print(f"[ERROR] Zone check failed: {e}")
-    return False
 
 def validate_eta(eta_str, zone_meta):
     try:
