@@ -6,11 +6,12 @@ import folium
 from dotenv import load_dotenv
 from shapely.geometry import Point, Polygon
 
-# -------------------- Load Environment --------------------
+# Load environment variables
 load_dotenv()
 gmaps = googlemaps.Client(key=os.getenv("GOOGLE_MAPS_API_KEY"))
 
-# -------------------- Database Connection --------------------
+# -------------------- Utility Functions --------------------
+
 def get_db_connection():
     conn = mysql.connector.connect(
         host=os.getenv("DB_HOST"),
@@ -23,15 +24,14 @@ def get_db_connection():
     conn.ping(reconnect=True, attempts=3, delay=5)
     return conn
 
-# -------------------- Google Maps Helpers --------------------
 def geocode_address(address):
     try:
         result = gmaps.geocode(address)
         if result:
             loc = result[0]['geometry']['location']
             return loc['lat'], loc['lng']
-    except Exception as e:
-        print("Geocode error:", e)
+    except:
+        pass
     return None, None
 
 def get_distance_and_time(origin, destination):
@@ -47,7 +47,25 @@ def get_distance_and_time(origin, destination):
 def get_direction_link(origin_lat, origin_lng, dest_lat, dest_lng):
     return f"https://www.google.com/maps/dir/?api=1&origin={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&travelmode=driving"
 
-# -------------------- Zones --------------------
+def get_preparation_time_summary(item_string):
+    if not item_string or not isinstance(item_string, str):
+        return 0, []
+    items = [i.strip().lower() for i in item_string.split(',')]
+    total_time = 0
+    details = []
+    for item in items:
+        default_time = 10
+        total_time += default_time
+        details.append(f"{item.title()} ({default_time} min)")
+    return total_time, details
+
+def find_zone(lat, lng, zones):
+    point = Point(lat, lng)
+    for z in zones:
+        if z['polygon'].contains(point):
+            return z['id'], z['title']
+    return None, None
+
 def load_zones():
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
@@ -66,41 +84,95 @@ def load_zones():
     conn.close()
     return zones
 
-# -------------------- Rider Helpers --------------------
-def get_available_riders(order_lat, order_lng, max_distance_km=10):
-    """
-    Returns sorted list of available riders within max_distance_km from the order location.
-    """
+def get_active_delivery_zone(zone_id):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, title, lats, longs FROM tbl_rider WHERE rstatus = 0")
+    cursor.execute("""
+        SELECT id, zone_name, zone_data, radius_km, delivery_time_min, delivery_time_max
+        FROM tbl_delivery_zones
+        WHERE id = %s AND is_active = 1
+    """, (zone_id,))
+    zone = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return zone
+
+def is_within_zone(lat, lng, zone_data, radius_km):
+    center_lat = zone_data['center_lat']
+    center_lng = zone_data['center_lng']
+    distance = ((lat - center_lat)**2 + (lng - center_lng)**2)**0.5 * 111
+    return distance <= radius_km
+
+def validate_eta(eta_str, zone_meta):
+    try:
+        eta_min = int(eta_str.replace(' mins', '').replace(' min', '').strip())
+        return zone_meta['delivery_time_min'] <= eta_min <= zone_meta['delivery_time_max']
+    except:
+        return False
+
+# -------------------- Rider Logic --------------------
+
+def get_available_riders(zone_id=None):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    query = """
+        SELECT r.id, r.title, ra.current_lat, ra.current_lng, ra.is_available,
+               ra.active_order_count, ra.max_capacity,
+               rp.acceptance_rate, rp.avg_delivery_time, rp.rejection_count
+        FROM tbl_rider r
+        JOIN tbl_rider_availability ra ON r.id = ra.rider_id
+        LEFT JOIN tbl_rider_performance rp ON r.id = rp.rider_id
+        WHERE r.status = 1 AND ra.is_available = 1 AND ra.active_order_count < ra.max_capacity
+    """
+    cursor.execute(query)
     riders = cursor.fetchall()
     cursor.close()
     conn.close()
 
-    nearby_riders = []
-    for r in riders:
-        try:
-            dist_text, eta_text = get_distance_and_time(
-                (float(r['lats']), float(r['longs'])),
-                (order_lat, order_lng)
-            )
-            if dist_text:
-                dist_val = float(dist_text.replace(" km", "").replace(",", ""))
-                if dist_val <= max_distance_km:
-                    nearby_riders.append({
-                        "id": r["id"],
-                        "title": r["title"],
-                        "distance": dist_text,
-                        "eta": eta_text,
-                        "route_link": get_direction_link(r['lats'], r['longs'], order_lat, order_lng)
-                    })
-        except Exception as e:
-            print(f"Error with rider {r['title']}: {e}")
+    if zone_id:
+        route_riders = get_riders_by_route(zone_id)
+        riders = [r for r in riders if r['id'] in route_riders]
 
-    # Sort by distance
-    nearby_riders.sort(key=lambda x: float(x["distance"].replace(" km", "").replace(",", "")))
-    return nearby_riders
+    return riders
+
+def get_riders_by_route(zone_id):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT DISTINCT rider_id FROM tbl_rider_routes WHERE zone_id = %s", (zone_id,))
+    rider_ids = [r['rider_id'] for r in cursor.fetchall()]
+    cursor.close()
+    conn.close()
+    return rider_ids
+
+def calculate_rider_score(rider, dist_km):
+    acceptance_rate = rider.get('acceptance_rate') or 0
+    avg_delivery_time = rider.get('avg_delivery_time') or 30
+    score = (
+        0.5 * acceptance_rate +
+        0.3 * (1 / (dist_km + 1)) +
+        0.2 * (1 / (avg_delivery_time + 1))
+    )
+    return score
+
+# -------------------- Assignment & Notification --------------------
+
+def assign_order(order_id, rider_id, table_name, score, zone_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE {table_name} SET rid = %s, order_status = 1 WHERE id = %s", (rider_id, order_id))
+    cursor.execute("UPDATE tbl_rider SET rstatus = 1 WHERE id = %s", (rider_id,))
+    cursor.execute("UPDATE tbl_rider_availability SET active_order_count = active_order_count + 1 WHERE rider_id = %s", (rider_id,))
+    cursor.execute("""
+        INSERT INTO tbl_rider_assignment (order_id, rider_id, assigned_at, score)
+        VALUES (%s, %s, NOW(), %s)
+    """, (order_id, rider_id, score))
+    cursor.execute("""
+        INSERT INTO tbl_delivery (order_id, rider_id, rider_response, status, assigned_at, zone_id)
+        VALUES (%s, %s, %s, %s, NOW(), %s)
+    """, (order_id, rider_id, 'pending', 'assigned', zone_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def insert_rider_notifications(order_id, rider_ids, table_name):
     conn = get_db_connection()
@@ -110,27 +182,10 @@ def insert_rider_notifications(order_id, rider_ids, table_name):
             INSERT INTO tbl_notification (uid, datetime, title, description, related_id, type)
             VALUES (%s, NOW(), %s, %s, %s, %s)
         """, (rid, "New Order Available", f"Please accept Order #{order_id}", order_id, table_name))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def simulate_rider_acceptance(order_id, rider_ids):
-    time.sleep(1)
-    accepted = rider_ids[0]
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    for rid in rider_ids[1:]:
-        cursor.execute("DELETE FROM tbl_notification WHERE uid = %s AND related_id = %s", (rid, order_id))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return accepted
-
-def assign_order(order_id, rider_id, table_name):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(f"UPDATE {table_name} SET rid = %s, order_status = 1 WHERE id = %s", (rider_id, order_id))
-    cursor.execute("UPDATE tbl_rider SET rstatus = 1 WHERE id = %s", (rider_id,))
+        cursor.execute("""
+            INSERT INTO tbl_rnoti (rid, msg, date)
+            VALUES (%s, %s, NOW())
+        """, (rid, f"Order #{order_id} is available",))
     conn.commit()
     cursor.close()
     conn.close()
@@ -146,14 +201,19 @@ def notify_user(uid, order_id, name):
     cursor.close()
     conn.close()
 
-def find_zone(lat, lng, zones):
-    point = Point(lat, lng)
-    for z in zones:
-        if z['polygon'].contains(point):
-            return z['id'], z['title']
-    return None, None
+def log_rider_rejection(order_id, rider_id, reason):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO tbl_rider_rejections (order_id, rider_id, rejection_time, reason, created_at)
+        VALUES (%s, %s, NOW(), %s, NOW())
+    """, (order_id, rider_id, reason))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-# -------------------- Main Logic --------------------
+# -------------------- Core Assignment Logic --------------------
+
 def process_order_table(table_name):
     zones = load_zones()
     conn = get_db_connection()
@@ -175,31 +235,84 @@ def process_order_table(table_name):
             continue
 
         zone_id, zone_title = find_zone(lat, lng, zones)
+        zone_meta = get_active_delivery_zone(zone_id)
 
-        nearby_riders = get_available_riders(lat, lng)
-        if nearby_riders:
-            nearest = nearby_riders[0]  #  under radius rider
-            insert_rider_notifications(order['id'], [nearest['id']], table_name)
-            accepted_id = simulate_rider_acceptance(order['id'], [nearest['id']])
-            assign_order(order['id'], accepted_id, table_name)
-            notify_user(order['uid'], order['id'], order['name'])
+        if not zone_meta:
+            print(f"Zone #{zone_id} inactive or undefined. Skipping Order #{order['id']}")
+            continue
+
+        if not is_within_zone(lat, lng, zone_meta['zone_data'], zone_meta['radius_km']):
+            print(f"Order #{order['id']} outside zone radius. Skipping.")
+            continue
+
+        riders = get_available_riders(zone_id)
+
+        if table_name == "tbl_normal_order":
+            total_time, prep_details = get_preparation_time_summary(order.get('items'))
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT ptitle FROM tbl_subscribe_order_product WHERE oid = %s", (order['id'],))
+            products = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            item_names = [p['ptitle'] for p in products]
+            total_time, prep_details = get_preparation_time_summary(','.join(item_names))
+
+        best_score, nearest_rider = -1, None
+        best_dist, best_eta, best_link = None, None, None
+        rejected_riders = []
+
+        for r in riders:
+            r_lat, r_lng = float(r['current_lat']), float(r['current_lng'])
+            dist, eta = get_distance_and_time((r_lat, r_lng), (lat, lng))
+
+            if dist and eta:
+                dist_km = float(dist.replace(' km', '').replace(',', ''))
+                if not validate_eta(eta, zone_meta):
+                    rejected_riders.append((r['id'], "eta_invalid"))
+                    continue
+                score = calculate_rider_score(r, dist_km)
+                if score > best_score:
+                    nearest_rider = r
+                    best_score = score
+                    best_dist = dist
+                    best_eta = eta
+                    best_link = get_direction_link(r_lat, r_lng, lat, lng)
+                else:
+                    rejected_riders.append((r['id'], "low_score"))
+            else:
+                rejected_riders.append((r['id'], "distance_eta_unavailable"))
+
+        if nearest_rider:
+            assign_order(order['id'], nearest_rider['id'], table_name, best_score, zone_id)
+            insert_rider_notifications(order['id'], [nearest_rider['id']], table_name)
+            notify_user(order.get('uid', 0), order['id'], order.get('name', 'User'))
 
             folium.Marker(
                 location=[lat, lng],
-                popup=f"Order #{order['id']} → {nearest['title']}\n{nearest['distance']}, {nearest['eta']}",
+                popup=f"Order #{order['id']} → {nearest_rider['title']}\n{best_dist}, {best_eta}",
                 icon=folium.Icon(color="green")
             ).add_to(order_map)
 
-            order['assigned_rider_name'] = nearest['title']
+            order['assigned_rider_name'] = nearest_rider['title']
             order['zone'] = zone_title
-            order['distance'] = nearest['distance']
-            order['eta'] = nearest['eta']
-            order['route_link'] = nearest['route_link']
+            order['distance'] = best_dist
+            order['eta'] = best_eta
+            order['route_link'] = best_link
             assigned_orders.append(order)
             assigned += 1
+
+            for rider_id, reason in rejected_riders:
+                if rider_id != nearest_rider['id']:
+                    log_rider_rejection(order['id'], rider_id, reason)
         else:
             not_assigned += 1
+            print(f"No available rider for Order #{order['id']}")
+            for rider_id, reason in rejected_riders:
+                log_rider_rejection(order['id'], rider_id, reason)
 
     order_map.save("order_assignment_map.html")
     return assigned, not_assigned, assigned_orders
 
+   
