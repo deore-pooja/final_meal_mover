@@ -310,7 +310,7 @@ def process_order_table(table_name):
                     # Added try-except for robust dist_km conversion
                     dist_km = float(dist.replace(' km', '').replace(',', ''))
                 except ValueError:
-                    dist_km = 5
+                    dist_km = 10
                 if not validate_eta(eta, zone_meta):
                     rejected_riders.append((r['id'], "eta_invalid"))
                     continue
