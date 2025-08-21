@@ -61,8 +61,8 @@ def get_preparation_time_summary(item_string):
         details.append(f"{item.title()} ({default_time} min)")
     return total_time, details
 
-def find_zone(lng, lat, zones):
-    point = Point(lng, lat)
+def find_zone(lat, lng, zones):
+    point = Point(lat, lng)
     for z in zones:
         if z['polygon'].contains(point):
             return z['id'], z['title']
