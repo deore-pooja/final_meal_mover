@@ -1,47 +1,56 @@
 import os
 import time
-import json
 import mysql.connector
 import googlemaps
 import folium
 from flask import Flask, jsonify
 from dotenv import load_dotenv
-from shapely.geometry import Point
-from shapely.wkt import loads as wkt_loads
-from datetime import datetime
+from shapely.geometry import Point, Polygon
 
 # Load environment variables
 load_dotenv()
 gmaps = googlemaps.Client(key=os.getenv("GOOGLE_MAPS_API_KEY"))
+
+# Default preparation time logic
+prep_time_dict = {}  # No external data loaded
+
+def get_preparation_time_summary(item_string):
+    items = [i.strip().lower() for i in item_string.split(',')]
+    total_time = 0
+    details = []
+
+    for item in items:
+        default_time = 10  # Default time per item
+        total_time += default_time
+        details.append(f"{item.title()} ({default_time} min)")
+
+    return total_time, details
+
+# Flask App setup
 app = Flask(__name__)
 
-# -------------------- Utility Functions --------------------
-
+# Database connection
 def get_db_connection():
-    try:
-        conn = mysql.connector.connect(
-            host=os.getenv("DB_HOST"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME"),
-            connect_timeout=60,
-            connection_timeout=60
-        )
-        conn.ping(reconnect=True, attempts=3, delay=5)
-        print("[INFO] Database connection successful.")
-        return conn
-    except mysql.connector.Error as err:
-        print(f"[ERROR] Database connection failed: {err}")
-        return None
+    conn = mysql.connector.connect(
+        host=os.getenv("DB_HOST"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        connect_timeout=60,
+        connection_timeout=60
+    )
+    conn.ping(reconnect=True, attempts=3, delay=5)
+    return conn
 
+# Geocoding helpers
 def geocode_address(address):
     try:
         result = gmaps.geocode(address)
         if result:
             loc = result[0]['geometry']['location']
             return loc['lat'], loc['lng']
-    except Exception as e:
-        print(f"[ERROR] Geocoding failed for '{address}':", e)
+    except:
+        pass
     return None, None
 
 def get_distance_and_time(origin, destination):
@@ -51,303 +60,162 @@ def get_distance_and_time(origin, destination):
             d = res['rows'][0]['elements'][0]
             return d['distance']['text'], d['duration']['text']
     except Exception as e:
-        print("[ERROR] Distance calculation error:", e)
+        print("Distance error:", e)
     return None, None
 
 def get_direction_link(origin_lat, origin_lng, dest_lat, dest_lng):
     return f"https://www.google.com/maps/dir/?api=1&origin={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&travelmode=driving"
 
-def get_preparation_time_summary(item_string):
-    if not item_string or not isinstance(item_string, str):
-        return 0, []
-    items = [i.strip().lower() for i in item_string.split(',')]
-    total_time = 0
-    details = []
-    for item in items:
-        default_time = 10
-        total_time += default_time
-        details.append(f"{item.title()} ({default_time} min)")
-    return total_time, details
+# Load delivery zones
+def load_zones():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, title, coordinates FROM zones WHERE status = 1")
+    zones = []
+    for row in cursor.fetchall():
+        try:
+            coords = [
+                tuple(map(float, pt.replace("(", "").replace(")", "").strip().split(',')))
+                for pt in row['coordinates'].split(',') if pt.count(',') == 1
+            ]
+            zones.append({'id': row['id'], 'title': row['title'], 'polygon': Polygon(coords)})
+        except:
+            continue
+    cursor.close()
+    conn.close()
+    return zones
+
+# Enhanced rider filtering
+def get_available_riders():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT r.id, r.title, ra.current_lat, ra.current_lng, ra.is_available, ra.active_order_count, ra.max_capacity
+        FROM tbl_rider r
+        JOIN tbl_rider_availability ra ON r.id = ra.rider_id
+        WHERE r.status = 1 AND ra.is_available = 1 AND ra.active_order_count < ra.max_capacity
+    """)
+    riders = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return riders
+
+# Notification helpers
+def insert_rider_notifications(order_id, rider_ids, table_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    for rid in rider_ids:
+        cursor.execute("""
+            INSERT INTO tbl_notification (uid, datetime, title, description, related_id, type)
+            VALUES (%s, NOW(), %s, %s, %s, %s)
+        """, (rid, "New Order Available", f"Please accept Order #{order_id}", order_id, table_name))
+        cursor.execute("""
+            INSERT INTO tbl_rnoti (rid, msg, date)
+            VALUES (%s, %s, NOW())
+        """, (rid, f"Order #{order_id} is available",))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def simulate_rider_acceptance(order_id, rider_ids):
+    time.sleep(1)
+    accepted = rider_ids[0]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    for rid in rider_ids[1:]:
+        cursor.execute("DELETE FROM tbl_notification WHERE uid = %s AND related_id = %s", (rid, order_id))
+        cursor.execute("""
+            INSERT INTO tbl_rider_rejections (order_id, rider_id, rejection_time, reason, created_at)
+            VALUES (%s, %s, NOW(), %s, NOW())
+        """, (order_id, rid, "Auto-rejected"))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return accepted
+
+def assign_order(order_id, rider_id, table_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE {table_name} SET rid = %s, order_status = 1 WHERE id = %s", (rider_id, order_id))
+    cursor.execute("UPDATE tbl_rider SET rstatus = 1 WHERE id = %s", (rider_id,))
+    cursor.execute("""
+        UPDATE tbl_rider_availability SET active_order_count = active_order_count + 1 WHERE rider_id = %s
+    """, (rider_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def notify_user(uid, order_id, name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO tbl_notification (uid, datetime, title, description)
+        VALUES (%s, NOW(), %s, %s)
+    """, (uid, "Order Assigned!", f"{name}, your Order #{order_id} has been assigned."))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def find_zone(lat, lng, zones):
-    point = Point(lng, lat)
+    point = Point(lat, lng)
     for z in zones:
         if z['polygon'].contains(point):
             return z['id'], z['title']
     return None, None
 
-def load_zones():
-    conn = get_db_connection()
-    if not conn:
-        return []
-    cursor = conn.cursor(dictionary=True)
-    # Correctly fetch GEOMETRY data as WKT string
-    cursor.execute("SELECT id, title, ST_AsText(coordinates) as coordinates FROM zones WHERE status = 1")
-    zones = []
-    for row in cursor.fetchall():
-        try:
-            # Use shapely.wkt.loads to create a Polygon from the WKT string
-            polygon_shape = wkt_loads(row['coordinates'])
-            zones.append({'id': row['id'], 'title': row['title'], 'polygon': polygon_shape})
-        except Exception as e:
-            print(f"[ERROR] Zone parsing failed for zone {row['id']}: {e}")
-            continue
-    cursor.close()
-    conn.close()
-    print(f"[INFO] Loaded {len(zones)} active zones.")
-    return zones
-
-def get_active_delivery_zone(zone_id):
-    if not zone_id:
-        return None
-    conn = get_db_connection()
-    if not conn:
-        return None
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT id, zone_name, zone_data, radius_km, delivery_time_min, delivery_time_max
-        FROM tbl_delivery_zones
-        WHERE id = %s AND is_active = 1
-    """, (zone_id,))
-    zone = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if zone and isinstance(zone.get("zone_data"), str):
-        try:
-            zone["zone_data"] = json.loads(zone["zone_data"])
-        except Exception:
-            zone["zone_data"] = {}
-    return zone
-
-def validate_eta(eta_str, zone_meta):
-    try:
-        eta_minutes = int(eta_str.replace(' mins', '').replace(' min', '').strip())
-        return zone_meta['delivery_time_min'] <= eta_minutes <= zone_meta['delivery_time_max']
-    except (ValueError, KeyError) as e:
-        print(f"[ERROR] ETA validation failed: {e}")
-        return False
-
-# -------------------- Rider Logic --------------------
-
-def get_available_riders():
-    conn = get_db_connection()
-    if not conn:
-        return []
-    cursor = conn.cursor(dictionary=True)
-    query = """
-        SELECT r.id, r.title, ra.current_lat, ra.current_lng, ra.is_available,
-               ra.active_order_count, ra.max_capacity,
-               rp.acceptance_rate, rp.avg_delivery_time
-        FROM tbl_rider r
-        JOIN tbl_rider_availability ra ON r.id = ra.rider_id
-        LEFT JOIN tbl_rider_performance rp ON r.id = rp.rider_id
-        WHERE r.status = 1 AND ra.is_available = 1 AND ra.active_order_count < ra.max_capacity
-    """
-    cursor.execute(query)
-    riders = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    print(f"[INFO] Found {len(riders)} available riders.")
-    return riders
-
-def calculate_rider_score(rider, dist_km):
-    acceptance_rate = rider.get('acceptance_rate') or 0
-    avg_delivery_time = rider.get('avg_delivery_time') or 30
-    score = (
-        0.5 * acceptance_rate +
-        0.3 * (1 / (dist_km + 1)) +
-        0.2 * (1 / (avg_delivery_time + 1))
-    )
-    return score
-
-# -------------------- Assignment & Notification --------------------
-
-def assign_order(order_id, rider_id, table_name, score, zone_id):
-    conn = get_db_connection()
-    if not conn:
-        return
-    cursor = conn.cursor()
-    try:
-        cursor.execute(f"UPDATE {table_name} SET rid = %s, order_status = 1 WHERE id = %s", (rider_id, order_id))
-        cursor.execute("UPDATE tbl_rider_availability SET active_order_count = active_order_count + 1 WHERE rider_id = %s", (rider_id,))
-        cursor.execute("""
-            INSERT INTO tbl_rider_assignments (order_id, rider_id, assignment_time, status, score)
-            VALUES (%s, %s, NOW(), 'pending', %s)
-        """, (order_id, rider_id, score))
-        conn.commit()
-        print(f"[INFO] Assigned Order #{order_id} to Rider #{rider_id}.")
-    except mysql.connector.Error as err:
-        conn.rollback()
-        print(f"[ERROR] Failed to assign order: {err}")
-    finally:
-        cursor.close()
-        conn.close()
-
-def insert_rider_notifications(order_id, rider_ids, table_name):
-    conn = get_db_connection()
-    if not conn:
-        return
-    cursor = conn.cursor()
-    try:
-        for rid in rider_ids:
-            cursor.execute("""
-                INSERT INTO tbl_notification (uid, datetime, title, description, related_id, type)
-                VALUES (%s, NOW(), %s, %s, %s, %s)
-            """, (rid, "New Order Available", f"Please accept Order #{order_id}", order_id, table_name))
-            cursor.execute("""
-                INSERT INTO tbl_rnoti (rid, msg, date)
-                VALUES (%s, %s, NOW())
-            """, (rid, f"Order #{order_id} is available",))
-        conn.commit()
-        print(f"[INFO] Notifications sent to riders: {rider_ids}.")
-    except mysql.connector.Error as err:
-        conn.rollback()
-        print(f"[ERROR] Failed to insert rider notifications: {err}")
-    finally:
-        cursor.close()
-        conn.close()
-
-def notify_user(uid, order_id, name):
-    conn = get_db_connection()
-    if not conn:
-        return
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            INSERT INTO tbl_notification (uid, datetime, title, description)
-            VALUES (%s, NOW(), %s, %s)
-        """, (uid, "Order Assigned!", f"{name}, your Order #{order_id} has been assigned."))
-        conn.commit()
-        print(f"[INFO] User #{uid} notified for Order #{order_id}.")
-    except mysql.connector.Error as err:
-        conn.rollback()
-        print(f"[ERROR] Failed to notify user: {err}")
-    finally:
-        cursor.close()
-        conn.close()
-
-def log_rider_rejection(order_id, rider_id, reason):
-    conn = get_db_connection()
-    if not conn:
-        return
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            INSERT INTO tbl_rider_rejections (order_id, rider_id, rejection_time, reason, created_at)
-            VALUES (%s, %s, NOW(), %s, NOW())
-        """, (order_id, rider_id, reason))
-        conn.commit()
-        print(f"[WARN] Rider #{rider_id} rejected Order #{order_id} (Reason: {reason}).")
-    except mysql.connector.Error as err:
-        conn.rollback()
-        print(f"[ERROR] Failed to log rejection: {err}")
-    finally:
-        cursor.close()
-        conn.close()
-
-# -------------------- Core Assignment Logic --------------------
-
+# Order assignment logic
 def process_order_table(table_name):
     zones = load_zones()
+    riders = get_available_riders()
     conn = get_db_connection()
-    if not conn:
-        return 0, 0, []
     cursor = conn.cursor(dictionary=True)
-    cursor.execute(f"SELECT * FROM `{table_name}` WHERE `order_status` = 0")
+    cursor.execute(f"SELECT * FROM {table_name} WHERE order_status = 0")
     orders = cursor.fetchall()
     cursor.close()
     conn.close()
-
-    print(f"[INFO] Found {len(orders)} pending orders in {table_name}.")
 
     order_map = folium.Map(location=[18.6, 73.75], zoom_start=12)
     assigned_orders = []
     assigned, not_assigned = 0, 0
 
-    available_riders = get_available_riders()
-    if not available_riders:
-        print("[WARN] No available riders to assign orders to.")
-        return 0, len(orders), []
-
     for order in orders:
-        print(f"\n[PROCESS] Order #{order['id']}.")
-        
-        full_address = f"{order['address']}, {order['landmark']}" if order.get('landmark') else order['address']
+        full_address = f"{order['address']}, {order['landmark']}"
         lat, lng = geocode_address(full_address)
         if not lat or not lng:
-            print(f"[WARN] Skipping Order #{order['id']} → Invalid address or geocoding failed.")
-            not_assigned += 1
+            print(f"Skipping Order #{order['id']} (Invalid address)")
             continue
 
         zone_id, zone_title = find_zone(lat, lng, zones)
-        if not zone_id:
-            print(f"[WARN] Skipping Order #{order['id']} → Not in any active zone.")
-            not_assigned += 1
-            continue
 
-        zone_meta = get_active_delivery_zone(zone_id)
-        if not zone_meta:
-            print(f"[WARN] Skipping Order #{order['id']} → Zone #{zone_id} is inactive.")
-            not_assigned += 1
-            continue
-
-        # Get relevant prep time
-        if table_name == "tbl_normal_order":
-            total_time, prep_details = get_preparation_time_summary(order.get('items'))
-        else: # For subscription orders
-            conn_sub = get_db_connection()
-            if not conn_sub:
-                continue
-            cursor_sub = conn_sub.cursor(dictionary=True)
-            cursor_sub.execute("SELECT ptitle FROM tbl_subscribe_order_product WHERE oid = %s", (order['id'],))
-            products = cursor_sub.fetchall()
-            cursor_sub.close()
-            conn_sub.close()
+        total_time, prep_details = 0, []
+        if table_name == "tbl_normal_order" and 'items' in order:
+            total_time, prep_details = get_preparation_time_summary(order['items'])
+        elif table_name == "tbl_subscribe_order":
+            conn = get_db_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT ptitle FROM tbl_subscribe_order_product WHERE oid = %s", (order['id'],))
+            products = cursor.fetchall()
+            cursor.close()
+            conn.close()
             item_names = [p['ptitle'] for p in products]
             total_time, prep_details = get_preparation_time_summary(','.join(item_names))
 
-        best_score, nearest_rider = -1, None
-        best_dist, best_eta, best_link = None, None, None
-        rejected_riders = []
-
-        for r in available_riders:
+        nearest_rider, best_dist, best_eta, best_link = None, None, None, None
+        for r in riders:
             r_lat, r_lng = float(r['current_lat']), float(r['current_lng'])
             dist, eta = get_distance_and_time((r_lat, r_lng), (lat, lng))
+            if dist and (best_dist is None or float(dist.replace(' km', '').replace(',', '')) < float(best_dist.replace(' km', '').replace(',', ''))):
+                nearest_rider = r
+                best_dist, best_eta = dist, eta
+                best_link = get_direction_link(r_lat, r_lng, lat, lng)
 
-            if dist and eta:
-                try:
-                    dist_km = float(dist.replace(' km', '').replace(',', ''))
-                except ValueError:
-                    dist_km = 999999
-                
-                if not validate_eta(eta, zone_meta):
-                    rejected_riders.append((r['id'], "eta_invalid"))
-                    continue
-                score = calculate_rider_score(r, dist_km)
-                if score > best_score:
-                    if nearest_rider:
-                        rejected_riders.append((nearest_rider['id'], "low_score"))
-                    nearest_rider = r
-                    best_score = score
-                    best_dist = dist
-                    best_eta = eta
-                    best_link = get_direction_link(r_lat, r_lng, lat, lng)
-                else:
-                    rejected_riders.append((r['id'], "low_score"))
-            else:
-                rejected_riders.append((r['id'], "distance_eta_unavailable"))
-        
         if nearest_rider:
-            assign_order(order['id'], nearest_rider['id'], table_name, best_score, zone_id)
-            insert_rider_notifications(order['id'], [nearest_rider['id']], table_name)
-            notify_user(order.get('uid', 0), order['id'], order.get('name', 'User'))
-            
             folium.Marker(
                 location=[lat, lng],
                 popup=f"Order #{order['id']} → {nearest_rider['title']}\n{best_dist}, {best_eta}",
                 icon=folium.Icon(color="green")
             ).add_to(order_map)
-            
+
             order['assigned_rider_name'] = nearest_rider['title']
             order['zone'] = zone_title
             order['distance'] = best_dist
@@ -355,20 +223,14 @@ def process_order_table(table_name):
             order['route_link'] = best_link
             assigned_orders.append(order)
             assigned += 1
-            
-            for rider_id, reason in rejected_riders:
-                log_rider_rejection(order['id'], rider_id, reason)
         else:
             not_assigned += 1
-            print(f"[WARN] No rider selected for Order #{order['id']} after all checks.")
-            for rider_id, reason in rejected_riders:
-                log_rider_rejection(order['id'], rider_id, reason)
+            print(f"No available rider for Order #{order['id']}")
 
     order_map.save("order_assignment_map.html")
     return assigned, not_assigned, assigned_orders
 
-# -------------------- Flask Routes --------------------
-
+# -------------------- Flask Endpoints --------------------
 @app.route('/')
 def home():
     return jsonify({"message": "API is working!"})
@@ -390,7 +252,7 @@ def assign_orders():
                 "eta": order.get("eta"),
                 "google_maps_link": order.get("route_link")
             })
-            
+
         return jsonify({
             "assigned": a1 + a2,
             "not_assigned": n1 + n2,
@@ -398,9 +260,9 @@ def assign_orders():
             "details": detailed_assignments
         })
     except Exception as e:
-        print(f"[ERROR] in /assign_orders: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)})
 
+# -------------------- Run Locally or Render --------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, debug=True)
