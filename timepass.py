@@ -15,6 +15,8 @@ app = Flask(__name__)
 
 # -------------------- Utility Functions --------------------
 
+# -------------------- Utility Functions --------------------
+
 def get_db_connection():
     try:
         conn = mysql.connector.connect(
@@ -79,18 +81,14 @@ def load_zones():
     if not conn:
         return []
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, title, coordinates FROM zones WHERE status = 1")
+    # Use ST_AsText to convert the GEOMETRY object to a readable string (WKT)
+    cursor.execute("SELECT id, title, ST_AsText(coordinates) AS coordinates FROM zones WHERE status = 1")
     zones = []
     for row in cursor.fetchall():
         try:
-            coords_str = row['coordinates'].replace('),(', ';').replace('(', '').replace(')', '').split(';')
-            coords = [
-                tuple(map(float, pt.strip().split(',')))
-                for pt in coords_str if pt.strip()
-            ]
-            # Polygon expects (longitude, latitude)
-            polygon_coords = [(c[1], c[0]) for c in coords]
-            zones.append({'id': row['id'], 'title': row['title'], 'polygon': Polygon(polygon_coords)})
+            # The coordinates are now a WKT string, which shapely can parse directly
+            polygon_shape = shape(row['coordinates'])
+            zones.append({'id': row['id'], 'title': row['title'], 'polygon': polygon_shape})
         except Exception as e:
             print(f"[ERROR] Zone parsing failed for zone {row['id']}: {e}")
             continue
