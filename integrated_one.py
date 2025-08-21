@@ -1,11 +1,12 @@
 import os
 import time
+import json
 import mysql.connector
 import googlemaps
 import folium
 from flask import Flask, jsonify
 from dotenv import load_dotenv
-from shapely.geometry import Point, Polygon
+from shapely.geometry import Point, Polygon, shape
 
 # Load environment variables
 load_dotenv()
@@ -62,7 +63,7 @@ def get_preparation_time_summary(item_string):
     return total_time, details
 
 def find_zone(lat, lng, zones):
-    point = Point(lat, lng)
+    point = Point(lng, lat)   # (lng, lat)
     for z in zones:
         if z['polygon'].contains(point):
             return z['id'], z['title']
@@ -77,7 +78,7 @@ def load_zones():
         try:
             coords = [
                 tuple(map(float, pt.replace("(", "").replace(")", "").strip().split(',')))
-                for pt in row['coordinates'].split(',') if pt.count(',') == 1
+                for pt in row['coordinates'].split(';') if pt.strip()
             ]
             zones.append({'id': row['id'], 'title': row['title'], 'polygon': Polygon(coords)})
         except Exception as e:
@@ -101,17 +102,37 @@ def get_active_delivery_zone(zone_id):
     zone = cursor.fetchone()
     cursor.close()
     conn.close()
+
+    if zone and isinstance(zone.get("zone_data"), str):
+        try:
+            zone["zone_data"] = json.loads(zone["zone_data"])
+        except Exception:
+            zone["zone_data"] = {}
     return zone
 
-def is_within_zone(lat, lng, zone_data, radius_km):
+def is_within_zone(lat, lng, zone_data, radius_km=None):
+    """
+    Check if user location lies inside polygon (preferred), 
+    or within radius fallback if polygon not available.
+    """
     try:
-        center_lat = zone_data['center_lat']
-        center_lng = zone_data['center_lng']
-        distance = ((lat - center_lat)**2 + (lng - center_lng)**2)**0.5 * 111  # Approx km
-        return distance <= radius_km
+        point = Point(lng, lat)  # shapely expects (lng, lat)
+
+        # If polygon data exists
+        if zone_data and "type" in zone_data:
+            polygon = shape(zone_data)
+            return polygon.contains(point)
+
+        # Fallback: radius check
+        if radius_km and "center_lat" in zone_data and "center_lng" in zone_data:
+            center_lat = float(zone_data['center_lat'])
+            center_lng = float(zone_data['center_lng'])
+            distance = ((lat - center_lat)**2 + (lng - center_lng)**2)**0.5 * 111  # rough km
+            return distance <= radius_km
+
     except Exception as e:
-        print("[ERROR] Zone radius check failed:", e)
-        return False
+        print(f"[ERROR] Zone check failed: {e}")
+    return False
 
 def validate_eta(eta_str, zone_meta):
     try:
