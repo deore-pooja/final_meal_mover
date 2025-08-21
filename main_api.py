@@ -1,6 +1,6 @@
-import os
 from flask import Flask, jsonify
 from order_assign import process_order_table
+import os
 
 app = Flask(__name__)
 
@@ -11,14 +11,18 @@ def home():
 @app.route('/assign_orders', methods=['GET'])
 def assign_orders():
     try:
-        a1, n1, list1 = process_order_table("tbl_normal_order")
-        a2, n2, list2 = process_order_table("tbl_subscribe_order")
+        # Process normal orders
+        assigned_normal, not_assigned_normal, normal_orders = process_order_table("tbl_normal_order")
 
+        # Process subscription orders
+        assigned_subscribe, not_assigned_subscribe, subscribe_orders = process_order_table("tbl_subscribe_order")
+
+        # Combine results
         detailed_assignments = []
-        for order in list1 + list2:
+        for order in normal_orders + subscribe_orders:
             detailed_assignments.append({
                 "order_id": order["id"],
-                "user_name": order["name"],
+                "user_name": order.get("name", "Unknown"),
                 "zone": order.get("zone"),
                 "assigned_rider": order.get("assigned_rider_name"),
                 "distance": order.get("distance"),
@@ -27,14 +31,15 @@ def assign_orders():
             })
 
         return jsonify({
-            "assigned": a1 + a2,
-            "not_assigned": n1 + n2,
+            "assigned": assigned_normal + assigned_subscribe,
+            "not_assigned": not_assigned_normal + not_assigned_subscribe,
             "message": "Order assignment completed. Map saved as order_assignment_map.html",
             "details": detailed_assignments
         })
-    except Exception as e:
-        return jsonify({"error": str(e)})
 
+    except Exception as e:
+        print("Error in /assign_orders:", e)
+        return jsonify({"error": str(e)})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
