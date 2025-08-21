@@ -53,7 +53,7 @@ def get_distance_and_time(origin, destination):
     return None, None
 
 def get_direction_link(origin_lat, origin_lng, dest_lat, dest_lng):
-    return f"https://www.google.com/maps/dir/?api=1&origin={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&travelmode=driving"
+    return f"http://maps.google.com/maps?q={origin_lat},{origin_lng}&destination={dest_lat},{dest_lng}&travelmode=driving"
 
 def get_preparation_time_summary(item_string):
     if not item_string or not isinstance(item_string, str):
@@ -147,7 +147,7 @@ def validate_eta(eta_str, zone_meta):
 
 # -------------------- Rider Logic --------------------
 
-def get_available_riders(zone_id=None):
+def get_available_riders():
     conn = get_db_connection()
     if not conn:
         return []
@@ -165,14 +165,7 @@ def get_available_riders(zone_id=None):
     riders = cursor.fetchall()
     cursor.close()
     conn.close()
-    print(f"[INFO] Found {len(riders)} available riders (zone_id={zone_id})")
-    if zone_id:
-        # Note: The provided `tbl_rider_routes` doesn't have a zone_id, so this function is
-        # commented out to avoid an error. A real implementation would link a route to a zone.
-        # route_riders = get_riders_by_route(zone_id)
-        # riders = [r for r in riders if r['id'] in route_riders]
-        # print(f"[INFO] Riders after route filter: {len(riders)}")
-        pass
+    print(f"[INFO] Found {len(riders)} available riders.")
     return riders
 
 def calculate_rider_score(rider, dist_km):
@@ -196,11 +189,11 @@ def assign_order(order_id, rider_id, table_name, score, zone_id):
         cursor.execute(f"UPDATE {table_name} SET rid = %s, order_status = 1 WHERE id = %s", (rider_id, order_id))
         cursor.execute("UPDATE tbl_rider_availability SET active_order_count = active_order_count + 1 WHERE rider_id = %s", (rider_id,))
         cursor.execute("""
-            INSERT INTO tbl_rider_assignments (order_id, rider_id, assignment_time, status)
-            VALUES (%s, %s, NOW(), 'pending')
-        """, (order_id, rider_id))
+            INSERT INTO tbl_rider_assignments (order_id, rider_id, assignment_time, status, score)
+            VALUES (%s, %s, NOW(), 'pending', %s)
+        """, (order_id, rider_id, score))
         conn.commit()
-        print(f"[INFO] Assigned Order #{order_id} to Rider #{rider_id}")
+        print(f"[INFO] Assigned Order #{order_id} to Rider #{rider_id}.")
     except mysql.connector.Error as err:
         conn.rollback()
         print(f"[ERROR] Failed to assign order: {err}")
@@ -224,7 +217,7 @@ def insert_rider_notifications(order_id, rider_ids, table_name):
                 VALUES (%s, %s, NOW())
             """, (rid, f"Order #{order_id} is available",))
         conn.commit()
-        print(f"[INFO] Notifications sent to riders: {rider_ids}")
+        print(f"[INFO] Notifications sent to riders: {rider_ids}.")
     except mysql.connector.Error as err:
         conn.rollback()
         print(f"[ERROR] Failed to insert rider notifications: {err}")
@@ -243,7 +236,7 @@ def notify_user(uid, order_id, name):
             VALUES (%s, NOW(), %s, %s)
         """, (uid, "Order Assigned!", f"{name}, your Order #{order_id} has been assigned."))
         conn.commit()
-        print(f"[INFO] User #{uid} notified for Order #{order_id}")
+        print(f"[INFO] User #{uid} notified for Order #{order_id}.")
     except mysql.connector.Error as err:
         conn.rollback()
         print(f"[ERROR] Failed to notify user: {err}")
@@ -262,7 +255,7 @@ def log_rider_rejection(order_id, rider_id, reason):
             VALUES (%s, %s, NOW(), %s, NOW())
         """, (order_id, rider_id, reason))
         conn.commit()
-        print(f"[WARN] Rider #{rider_id} rejected Order #{order_id} (Reason: {reason})")
+        print(f"[WARN] Rider #{rider_id} rejected Order #{order_id} (Reason: {reason}).")
     except mysql.connector.Error as err:
         conn.rollback()
         print(f"[ERROR] Failed to log rejection: {err}")
@@ -283,42 +276,46 @@ def process_order_table(table_name):
     cursor.close()
     conn.close()
 
-    print(f"[INFO] Found {len(orders)} pending orders in {table_name}")
+    print(f"[INFO] Found {len(orders)} pending orders in {table_name}.")
 
     order_map = folium.Map(location=[18.6, 73.75], zoom_start=12)
     assigned_orders = []
     assigned, not_assigned = 0, 0
 
+    available_riders = get_available_riders()
+    if not available_riders:
+        print("[WARN] No available riders to assign orders to.")
+        return 0, len(orders), []
+
     for order in orders:
-        print(f"\n[PROCESS] Order #{order['id']}")
+        print(f"\n[PROCESS] Order #{order['id']}.")
         
         full_address = f"{order['address']}, {order['landmark']}" if order.get('landmark') else order['address']
         lat, lng = geocode_address(full_address)
         if not lat or not lng:
-            print(f"[WARN] Skipping Order #{order['id']} → Invalid address")
+            print(f"[WARN] Skipping Order #{order['id']} → Invalid address or geocoding failed.")
+            not_assigned += 1
             continue
 
         zone_id, zone_title = find_zone(lat, lng, zones)
         if not zone_id:
-            print(f"[WARN] Order #{order['id']} not in any active zone")
+            print(f"[WARN] Skipping Order #{order['id']} → Not in any active zone.")
+            not_assigned += 1
             continue
 
         zone_meta = get_active_delivery_zone(zone_id)
         if not zone_meta:
-            print(f"[WARN] Zone #{zone_id} inactive for Order #{order['id']}")
-            continue
-
-        riders = get_available_riders(zone_id)
-        if not riders:
-            print(f"[WARN] No available riders for Order #{order['id']}")
+            print(f"[WARN] Skipping Order #{order['id']} → Zone #{zone_id} is inactive.")
             not_assigned += 1
             continue
 
+        # Get relevant prep time
         if table_name == "tbl_normal_order":
             total_time, prep_details = get_preparation_time_summary(order.get('items'))
-        else: # For subscription orders, fetch products from `tbl_subscribe_order_product`
+        else: # For subscription orders
             conn_sub = get_db_connection()
-            if not conn_sub: continue
+            if not conn_sub:
+                continue
             cursor_sub = conn_sub.cursor(dictionary=True)
             cursor_sub.execute("SELECT ptitle FROM tbl_subscribe_order_product WHERE oid = %s", (order['id'],))
             products = cursor_sub.fetchall()
@@ -331,14 +328,14 @@ def process_order_table(table_name):
         best_dist, best_eta, best_link = None, None, None
         rejected_riders = []
 
-        for r in riders:
+        for r in available_riders:
             r_lat, r_lng = float(r['current_lat']), float(r['current_lng'])
             dist, eta = get_distance_and_time((r_lat, r_lng), (lat, lng))
 
             if dist and eta:
                 try:
                     dist_km = float(dist.replace(' km', '').replace(',', ''))
-                except:
+                except ValueError:
                     dist_km = 999999
                 
                 if not validate_eta(eta, zone_meta):
@@ -381,7 +378,7 @@ def process_order_table(table_name):
                 log_rider_rejection(order['id'], rider_id, reason)
         else:
             not_assigned += 1
-            print(f"[WARN] No rider selected for Order #{order['id']}")
+            print(f"[WARN] No rider selected for Order #{order['id']} after all checks.")
             for rider_id, reason in rejected_riders:
                 log_rider_rejection(order['id'], rider_id, reason)
 
@@ -419,7 +416,7 @@ def assign_orders():
             "details": detailed_assignments
         })
     except Exception as e:
-        print("[ERROR] in /assign_orders:", e)
+        print(f"[ERROR] in /assign_orders: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
