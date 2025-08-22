@@ -75,15 +75,25 @@ def find_zone(lat, lng, zones):
     return None, None
 
 # -------------------- Rider Helpers --------------------
+
 def get_available_riders(order_lat, order_lng, max_distance_km=10):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
-    # Filter riders who are online, available, and have capacity
+    # This query correctly joins tbl_rider with tbl_rider_availability
     cursor.execute("""
-        SELECT ra.rider_id AS id, ra.current_lat AS lats, ra.current_lng AS longs, tr.title
-        FROM tbl_rider_availability ra
-        JOIN tbl_rider tr ON ra.rider_id = tr.id
-        WHERE ra.is_online = 1 AND ra.is_available = 1 AND ra.active_order_count < ra.max_capacity
+        SELECT 
+            tr.id, 
+            tr.title, 
+            tra.current_lat AS lats, 
+            tra.current_lng AS longs
+        FROM 
+            tbl_rider AS tr
+        JOIN 
+            tbl_rider_availability AS tra ON tr.id = tra.rider_id
+        WHERE 
+            tra.is_online = 1 
+            AND tra.is_available = 1 
+            AND tra.active_order_count < tra.max_capacity
     """)
     riders = cursor.fetchall()
     cursor.close()
